@@ -3,7 +3,6 @@ from pandas import Series
 from scipy.stats import norm, t as t_dist
 from datetime import datetime 
 from tqdm import tqdm
-from concurrent import futures
 from typing import Literal
 from arch import arch_model
 
@@ -11,6 +10,32 @@ windowsize = 1000
 alpha = 0.01
 horizon = 1 
 
+def _garch_process(
+    ti: int,
+    returns: Series,
+    window: int,
+    alpha: float,
+    horizon: int,
+    dist: Literal['normal', 't']):
+    train = returns[ti-window:ti]
+    model = arch_model(train, vol='GARCH', p=1, q=1, dist=dist)
+    res = model.fit(disp='off')
+    
+    forecast = res.forecast(horizon=horizon)
+    
+    sigma = np.sqrt(forecast.variance.values[-1,0])
+    mu = forecast.mean
+    
+    if dist == 't':
+        nu = res.params['nu']
+        scaling = np.sqrt((nu -2) / nu)
+        VaR = mu + sigma * t_dist.ppf(alpha, df=nu) * scaling
+    else: 
+        VaR = mu + sigma * norm.ppf(alpha)
+    
+    return returns.index[ti], VaR, returns[ti]
+    
+    
 def rolling_garch_var(
     returns:Series, window:int =1000,
     alpha: float=0.01, horizon:int=1,
@@ -39,30 +64,13 @@ def rolling_garch_var(
         Array of actual returns
     
     """
-    
+    from concurrent.futures import ProcessPoolExecutor, as_completed 
     indicies = list(range(window, len(returns) - horizon + 1))
     
-    def process(ti):
-        train = returns[ti-window:ti]
-        model = arch_model(train, vol='GARCH', p=1, q=1, dist=dist)
-        res = model.fit(disp='off')
-        
-        forecast = res.forecast(horizon=horizon)
-        
-        sigma = np.sqrt(forecast.variance.values[-1,0])
-        mu = forecast.mean
-        
-        if dist == 't':
-            nu = res.params['nu']
-            scaling = np.sqrt((nu -2) / nu)
-            VaR = mu + sigma * t_dist.ppf(alpha, df=nu) * scaling
-        else: 
-            VaR = mu + sigma * norm.ppf(alpha)
-        
-        return returns.index[ti], VaR, returns[ti]
     
-    with futures.ProcessPoolExecutor(max_workers=n_jobs) as executor: # type: ignore
-        futures = [executor.submit(process,t) for t in indicies]  # type: ignore
+    max_workers = None if n_jobs == -1 else n_jobs
+    with ProcessPoolExecutor(max_workers=max_workers) as executor: # type: ignore
+        futures = [executor.submit(_garch_process, t, returns, window, alpha, horizon, dist) for t in indicies]  # type: ignore
         
         results = {}
         pbar = tqdm(total=len(futures), desc="Calculating rolling GARCH VaR")
