@@ -5,8 +5,8 @@ import numpy as np
 from typing import cast
 
 def backtest_var(
-    returns: Series[float], 
-    var: Series[float]
+    returns: Series, 
+    var: Series
     ):
     """
     Creates an Indicator Series for Value-at-Risk exceedance. 
@@ -72,7 +72,7 @@ def kupiec_test(I:Series, alpha:float) -> dict[str, float]:
     
     p_value: float = cast(float, 1 - chi2.cdf(lr_POF, df=1))
     
-    result: dict[str,float] = {"LR_test": lr_POF,
+    result: dict[str,float] = {"LR_POF": lr_POF,
               r"1% significance:": chi_result[0],
               r"5% significance:": chi_result[1],
               "p-value": p_value}
@@ -134,7 +134,7 @@ def christofferssen_test(
     
     p_value: float = cast(float, 1 - chi2.cdf(LR_CCI, df=1))
     
-    result: dict[str,float] = {"Christofferssen LR test": LR_CCI,
+    result: dict[str,float] = {"LR_IND": LR_CCI,
               r"1% significance:": chi_result[0],
               r"5% significance:": chi_result[1],
               "p-value": p_value}
@@ -232,7 +232,7 @@ def duration_test_unconditional(I: Series, alpha: float):
     p_value: float = cast(float, 1 - chi2.cdf(LR,df=1))
     
     result: dict[str,float] = {  
-        "LR_duration": LR,
+        "LR_dur_unc": LR,
         "p-value":p_value,
         "lambda_hat": lambda_hat
     }
@@ -278,13 +278,13 @@ def duration_test_conditional(I: Series):
     
     res = minimize(neg_ll, x0=[1.0, np.mean(durations)], method='L-BFGS-B')
     
-    k_hat, lam_hat = res.x
+    k_hat, _ = res.x
     
     ll_H1 = -res.fun
     
     lam_exp = np.mean(durations)
     ll_H0 = np.sum(
-        np.log(1/lam_exp) - durations / lam_hat
+        np.log(1/lam_exp) - durations / lam_exp
     )
     
     LR = -2 * (ll_H0 - ll_H1)
@@ -292,7 +292,7 @@ def duration_test_conditional(I: Series):
     p_value: float = cast(float, 1 - chi2.cdf(LR,df=1))
     
     result: dict[str,float] = {
-        "LR_weibull": LR,
+        "LR_dur_con": LR,
         "p-value":p_value,
         "k_hat": k_hat
     }

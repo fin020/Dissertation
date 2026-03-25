@@ -70,7 +70,12 @@ def rolling_garch_var(
     
     max_workers = None if n_jobs == -1 else n_jobs
     with ProcessPoolExecutor(max_workers=max_workers) as executor: # type: ignore
-        futures = [executor.submit(_garch_process, t, returns, window, alpha, horizon, dist) for t in indicies]  # type: ignore
+        futures = [executor.submit(
+            _garch_process,
+            t, returns,
+            window, alpha,
+            horizon, dist)
+                   for t in indicies]  # type: ignore
         
         results = {}
         pbar = tqdm(total=len(futures), desc="Calculating rolling GARCH VaR")
@@ -86,4 +91,125 @@ def rolling_garch_var(
     actual = [results[t][1] for t in sorted_indicies]  
     
     return sorted_indicies, np.array(var_forecasts), np.array(actual)
+
+
+
+def _ms_process(
+    ti: int, 
+    returns: Series,
+    k_regimes: int=2,
+    window: int= 500,
+    alpha: float = 0.01,
+    horizon: int = 1,
+    min_variance: float = 1e-8,
+    ):
+    from statsmodels.tsa.regime_switching.markov_regression import MarkovRegression
+    from scipy.optimize import brentq
+    from scipy.stats import norm
+    train = returns[ti-window:ti]
+        
+    model = MarkovRegression(
+        train,
+        k_regimes=k_regimes,
+        trend='c', 
+        switching_variance=True
+        )
+    res = model.fit(maxiter=1000)
+    
+    param_names = model.param_names
+    params = res.params
+    
+    means = np.array([
+        params[param_names.index(f'const[{k}]')]
+        for k in range(k_regimes)
+    ])
+    variances = np.array([
+        params[param_names.index(f'sigma2[{k}]')]
+        for k in range(k_regimes)
+    ])
+    
+    if np.any(variances < 0):
+        print(f"Variance IS NEGATIVE: {variances}")
+    
+    variances = np.maximum(variances, min_variance)
+    sigmas = np.sqrt(variances)
+    
+    if np.any(sigmas <= 0) or np.any(np.isnan(means)) or np.any(np.isnan(sigmas)):
+            print("sigma is zero or negative or paramters are NaN")
+            return ti, np.nan, returns[ti]
+        
+    filtered_probs = res.filtered_marginal_probabilities
+    
+    trans_mat = res.regime_transition
+    
+    pi_next = filtered_probs @ trans_mat
+    
+    def cdf(x):
+        return np.sum(pi_next * norm.cdf((x - means) / sigmas)) - alpha
+    
+    low = np.minimum(means) - 5 * np.maximum(sigmas)
+    high = np.maximum(means) + 5 * np.maximum(sigmas)
+    
+    try:
+        q = brentq(cdf, low, high, xtol=1e-12)
+        var_forecast = -q
+    except ValueError:
+        print("ERROR WITH BRENTQ")
+        
+    return ti, var_forecast, returns[ti]
+    
+    
+def rolling_ms_var(returns: Series,
+    k_regimes: int=2,
+    window: int= 500,
+    alpha: float = 0.01,
+    horizon: int = 1,
+    min_variance: float = 1e-8,
+    n_jobs: int = -1
+    ):
+    
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+    from tqdm import tqdm
+    
+    indicies = list(range(window, len(returns) - horizon))
+    
+    max_workers = None if n_jobs == -1 else n_jobs
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(
+            _ms_process,
+            t, returns,
+            k_regimes, window,
+            alpha, horizon,
+            min_variance)
+                   for t in indicies]
+        
+        
+        results = {}
+        
+        pbar = tqdm(total=len(futures), desc="Rolling Markov Switching model loading")
+        
+        for future in as_completed(futures):
+            t, VaR, actuals = future.result()
+            results[t] = (VaR, actuals)
+            pbar.update(1)
+        pbar.close()
+        
+    sorted_indicies = sorted(results.keys())
+    var_results = [results[t][0] for t in sorted_indicies]
+    actual = [results[t][1] for t in sorted_indicies]
+    
+    return sorted_indicies, np.array(var_results), np.array(actual)
+            
+            
+        
+    
+    
+    
+    
+
+
+
+
+
+
    
