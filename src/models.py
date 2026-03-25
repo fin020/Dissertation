@@ -3,6 +3,7 @@ from pandas import Series
 from scipy.stats import norm, t as t_dist
 from datetime import datetime 
 from tqdm import tqdm
+from concurrent import futures
 from typing import Literal
 from arch import arch_model
 
@@ -13,7 +14,8 @@ horizon = 1
 def rolling_garch_var(
     returns:Series, window:int =1000,
     alpha: float=0.01, horizon:int=1,
-    dist:Literal['normal', "t"]='t'
+    dist:Literal['normal', "t"]='t',
+    n_jobs: int = -1
     ):
     """
     
@@ -38,21 +40,16 @@ def rolling_garch_var(
     
     """
     
-    returns = np.array(returns) # type: ignore
+    indicies = list(range(window, len(returns) - horizon + 1))
     
-    var_forecasts: list[float] = []
-    actual: list[float] = []
-    dates: list[datetime] = []
-    
-    for ti in tqdm(range(window, len(returns)-horizon)):
+    def process(ti):
         train = returns[ti-window:ti]
-        
         model = arch_model(train, vol='GARCH', p=1, q=1, dist=dist)
         res = model.fit(disp='off')
         
         forecast = res.forecast(horizon=horizon)
-        sigma = np.sqrt(forecast.variance.values[-1,0])
         
+        sigma = np.sqrt(forecast.variance.values[-1,0])
         mu = forecast.mean
         
         if dist == 't':
@@ -62,9 +59,23 @@ def rolling_garch_var(
         else: 
             VaR = mu + sigma * norm.ppf(alpha)
         
-        var_forecasts.append(VaR)
-        actual.append(returns[ti])
-        dates.append(returns.index[ti])
+        return returns.index[ti], VaR, returns[ti]
+    
+    with futures.ProcessPoolExecutor(max_workers=n_jobs) as executor: # type: ignore
+        futures = [executor.submit(process,t) for t in indicies]  # type: ignore
         
-    return np.array(var_forecasts), np.array(actual), np.array(dates)
+        results = {}
+        pbar = tqdm(total=len(futures), desc="Calculating rolling GARCH VaR")
+        
+        for future in as_completed(futures): # type: ignore
+            t, VaR, actual = future.result() # type: ignore
+            results[t] = (VaR, actual)
+            pbar.update(1)
+        pbar.close()
+        
+    sorted_indicies = sorted(results.keys())
+    var_forecasts = [results[t][0] for t in sorted_indicies]
+    actual = [results[t][1] for t in sorted_indicies]  
+    
+    return sorted_indicies, np.array(var_forecasts), np.array(actual)
    
