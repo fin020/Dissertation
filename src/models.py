@@ -225,6 +225,7 @@ class HaasMSGarch:
         self.regime_labels: dict[str, int] = {}
         self._returns: Optional[Series] = None
         self.is_fitted: bool = False
+        self._arr: Optional[np.ndarray] = None
     
     @property    
     def _n_garch(self) -> int:
@@ -319,5 +320,126 @@ class HaasMSGarch:
             scale = np.sqrt(nu / (nu-2.0))
             return float(t_dist.pdf(z * scale, df=nu) * scale / sigma)
         
+    def _filter(self,
+                params: np.ndarray,
+                returns: np.ndarray):
+        
+        k, garch, P = self._unpack(params)
+        K = self.k_regimes
+        T = len(returns)
+        
+        mu = np.array([gp['mu'] for gp in garch])
+        omega = np.array([gp['omega'] for gp in garch])
+        alpha = np.array([gp['alpha'] for gp in garch])
+        beta = np.array([gp['beta'] for gp in garch])
+       
+        if self.dist == 't':
+           nu = np.array([gp['nu'] for gp in garch])
+        else:
+            nu = None
+            
+        xi = self._stationary(P)
+        denom = 1 - alpha - beta
+        denom = np.maximum(denom, 1e-10)
+        h = omega / denom
+        h = np.maximum(h, 1e-12)
+        
+        xi_filtered = np.zeros((T,K), dtype=float)
+        h_all = np.zeros((T,K), dtype=float)
+        loglik = 0.0
+        
+        for t in range(T):
+            r_t = returns[t]
+            
+            h_all[t] = h
+            sqrt_h = np.sqrt(h)
+            z = (r_t-mu) / sqrt_h
+            
+            if self.dist == 'normal':
+                eta = norm.pdf(z) / sqrt_h
+            else:
+                 eta = t_dist(z, df=nu) / sqrt_h
+                
+            eta = np.maximum(eta, 1e-300)
+            
+            numerator = xi * eta
+            total = numerator.sum()
+            
+            if total <= 0 or not np.isinf(total):
+                return -1e10, xi_filtered, h_all
+            
+            loglik += np.log(total)
+            xi_filtered[t] = numerator / total
+            
+            xi = np.transpose(P) @ xi_filtered[t]
+            xi = np.maximum(xi, 1e-10)
+            xi /= xi.sum()
+            
+            
+            e2 = (r_t - mu) **2
+            h = omega + alpha * e2 + beta * h
+            h = np.maximum(h, 1e-10)
+            
+        return loglik, xi_filtered, h_all
+    
+    def _neg_loglik(self, params: np.ndarray):
+        
+        if not np.all(np.isfinite(params)):
+            print("WARNING: Non-finite parameters received.")
+            return 1e10
+        
+        _, garch, _ = self._unpack(params)
+        K = self.k_regimes
+        
+        for _, p in enumerate(params[:K]):
+            if not (1e-4 < p < 1-1e-4):
+                return 1e10
+        
+        for gp in garch:
+            if gp['omega'] < 0 or gp['alpha'] < 0 or gp['beta'] < 0:
+                return 1e10
+            if gp['alpha'] + gp['beta'] >= 0.99999:
+                return 1e10
+            if self.dist == 't' and gp.get('nu',10) <= 2.0:
+                return 1e10
+            
+        ll, _, _ = self._filter(params, self._arr)
+        return -ll
+    
+    def _bounds(self):
+        K = self.k_regimes
+        bounds = [(0.5, 0.99999)] * K
+        
+        for _ in range(K):
+            bounds += [
+                (-5.0, 5.0),  #mu
+                (1e-8, 10.0),  # omega
+                (1e-8, 0.5),  # alpha
+                (1e-8, 0.99999),  #beta
+            ]
+            if self.dist == 't':
+                bounds.append((2.01, 100))  # nu
+        
+        return bounds
 
     
+    def _starting_values(self, returns: np.ndarray) -> np.ndarray:
+        
+        K = self.k_regimes
+        abs_ret = np.abs(returns)
+        quantiles = np.linspace(0, 100, K+1)[1:-1]
+        thresholds = np.percentile(abs_ret, quantiles) if K > 2 else [np.percentile(abs_ret, 70)]
+        
+        
+        cluster = [[] for _ in range(K)]
+        for r in returns:
+            placed = False
+            for i, thr in enumerate(thresholds)
+        garch_x0 = []
+        for k in range(K):
+            
+                   
+         
+        
+            
+            
