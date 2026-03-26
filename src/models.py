@@ -138,7 +138,7 @@ def _ms_process(
             print("sigma is zero or negative or paramters are NaN")
             return ti, np.nan, returns[ti]
         
-    filtered_probs = res.filtered_marginal_probabilities
+    filtered_probs = res.filtered_marginal_probabilities.values[-1]
     
     trans_mat = res.regime_transition
     
@@ -147,8 +147,8 @@ def _ms_process(
     def cdf(x):
         return np.sum(pi_next * norm.cdf((x - means) / sigmas)) - alpha
     
-    low = np.minimum(means) - 5 * np.maximum(sigmas)
-    high = np.maximum(means) + 5 * np.maximum(sigmas)
+    low = np.min(means) - 5 * np.max(sigmas)
+    high = np.max(means) + 5 * np.max(sigmas)
     
     try:
         q = brentq(cdf, low, high, xtol=1e-12)
