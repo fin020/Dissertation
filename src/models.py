@@ -1,5 +1,6 @@
 import numpy as np 
 from numpy.linalg import solve
+import pandas as pd
 from pandas import Series
 from scipy.stats import norm, t as t_dist
 from datetime import datetime 
@@ -434,9 +435,154 @@ class HaasMSGarch:
         cluster = [[] for _ in range(K)]
         for r in returns:
             placed = False
-            for i, thr in enumerate(thresholds)
+            for i, thr in enumerate(thresholds):
+                if abs(r) <= thr:
+                    cluster[i].append(r)
+                    placed = True
+                    break
+            if not placed:
+                cluster[-1].append(r)
+        
+        p_diag = np.full(K,0.95)
+        
         garch_x0 = []
         for k in range(K):
+            rd = np.array(cluster[k] if len(cluster[k]) > 30 else returns)
+            mu_k = float(np.mean(rd))
+            var_k = max(float(np.var(rd)), 1e-5)
+            omega_k = var_k * 0.05
+            garch_x0 += [mu_k, omega_k, 0.05, 0.9]
+            if self.dist == 't':
+                garch_x0.append(8.0)
+                
+        return np.concatenate(p_diag, garch_x0)
+    
+    def fit(self,
+            returns :Series,
+            verbose: bool = True,
+            start_params: Optional[np.ndarray] = None
+            ) -> "HaasMSGarch":
+        
+        from scipy.optimize import minimize
+        from tqdm import tqdm
+        
+        self._returns = returns
+        self._arr = np.array(returns)
+        T = len(self._arr)
+        
+        if verbose:
+            print(f'Fitting Haas Markov_Switching GARCH(1,1) Model:'
+                  f' K = {self.k_regimes}, dist={self.dist}'
+                  f'\nParameters: {self.n_params} | Observations: {T}')
+            
+        best_ll = -np.inf
+        best_result = None
+        
+        if start_params is None:
+            x0_base = self._starting_values(self._arr)
+        else:
+            x0_base = start_params.copy()
+            if len(x0_base) != self.n_params:
+                raise ValueError(f'start param length {len(x0_base)} != {self.n_params}')
+            
+        total_evals = 0 
+        
+        pbar = tqdm(desc='Fitting MS_GARCH.', total=1000)
+        
+        def callback(xk: np.ndarray):
+            pbar.update(1)
+        
+        results = minimize(
+            self._neg_loglik,
+            x0=x0_base,
+            method='L-BFGS-B',
+            bounds=self._bounds(),
+            callback=callback,
+            options={'maxiter': 1000}
+        )
+        total_evals += results.nfev
+        
+        if verbose:
+            status = "Y" if results.success else "N"
+            print(f'Status: {status}'
+                f"LL = {results.fun:.4f}")
+            
+        if -results.fun > best_ll:
+            best_ll = -results.fun
+            best_result = results
+        
+        if verbose:
+            print(f"Total function evaluations: {total_evals}")
+        
+        if best_result is None or not np.isinf(best_ll):
+            raise RuntimeError("Optimisation failed to converge.")
+        
+        self.params_ = best_result.x
+        self.loglik_ = best_ll
+        
+        def AIC(ll: float, n_params: int):    
+            
+            AIC = 2.0 * (n_params - ll)
+            return  AIC
+        
+        self.aic_ = AIC(self.loglik_, self.n_params)
+        
+        def BIC(ll: float, n_params: int, T: int):
+            
+            BIC = n_params*np.log(T) - 2.0*ll
+            return BIC
+        
+        self.bic_ = BIC(self.loglik_, self.n_params, T)
+        
+        _, xi_filtered, h_all = self._filter(self.params_, self._arr)
+        
+        self.filtered_probs_ = pd.DataFrame(
+            xi_filtered,
+            index = returns.index,
+            columns=[f"P(S={k})" for k in range(self.k_regimes)]
+        )
+        
+        self.h_ = pd.DataFrame(
+            h_all, 
+            index=returns.index,
+            columns=[f"h_{k}" for k in range(self.k_regimes)]
+        )
+        
+        _, garch, _ = self._unpack(self.params_)
+        unc_var = np.array([
+            gp['omega'] / max((1.0-gp['alpha']-gp['beta'], 1e-5))
+            for gp in garch
+        ])
+        order = np.argsort(unc_var)
+        self.regime_labels = {
+            'low_vol': int(order[0]),
+            'high_vol': int(order[1])
+        }
+        
+        self.is_fitted = True
+        return self
+    
+    def summary(self):
+        if not self.is_fitted:
+            raise RuntimeError("Call .fit() first")
+        
+        _, garch, P = self._unpack(self.params_)
+        K = self.k_regimes
+        T = len(self._arr)
+        
+        print('=' * 50)
+        print('Haas MS-GARCH(1,1)')
+        print('=' * 50)
+        print(f'\nRegimes: {K}')      
+        print(f'\nDistribution: {self.dist}') 
+        print(f'\nSample: {self._returns.index[0].date()}')
+        print(f'\nLog-Lik: {self.loglik_}')
+        print(f'\nAIC: {self.aic_}')
+        print(f'\nBIC: {self.bic_}')
+        
+            
+            
+        
             
                    
          
