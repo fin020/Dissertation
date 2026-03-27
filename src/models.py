@@ -313,13 +313,13 @@ class HaasMSGarch:
                  nu: Optional[float] = None) -> float:
         
         sigma = np.sqrt(max(h, 1e-12))
-        z = (r-mu) / sigma
+        z = float((r-mu) / sigma)
         
         if self.dist == 'normal' or nu is None:
             return float(norm.pdf(z) / sigma)
         else:
             scale = np.sqrt(nu / (nu-2.0))
-            return float(t_dist.pdf(z * scale, df=nu) * scale / sigma)
+            return float(t_dist.pdf(float(z * scale), df=nu) * scale / sigma)
         
     def _filter(self,
                 params: np.ndarray,
@@ -359,14 +359,15 @@ class HaasMSGarch:
             if self.dist == 'normal':
                 eta = norm.pdf(z) / sqrt_h
             else:
-                 eta = t_dist(z, df=nu) / sqrt_h
+                 eta = t_dist.pdf(z, df=nu) / sqrt_h
                 
             eta = np.maximum(eta, 1e-300)
             
             numerator = xi * eta
             total = numerator.sum()
             
-            if total <= 0 or not np.isinf(total):
+            if total <= 0 or not np.isfinite(total):
+                print(f'total: {total}, eta: {eta}')
                 return -1e10, xi_filtered, h_all
             
             loglik += np.log(total)
@@ -394,14 +395,18 @@ class HaasMSGarch:
         
         for _, p in enumerate(params[:K]):
             if not (1e-4 < p < 1-1e-4):
+                print(f'p is {P}')
                 return 1e10
         
         for gp in garch:
             if gp['omega'] < 0 or gp['alpha'] < 0 or gp['beta'] < 0:
+                print(f' Omega: {gp['omega']} alpha:  {gp['alpha']} beta: {gp['beta']}')
                 return 1e10
             if gp['alpha'] + gp['beta'] >= 0.99999:
+                print(f'Persistence is: {gp['alpha'] + gp['beta']}')
                 return 1e10
             if self.dist == 't' and gp.get('nu',10) <= 2.0:
+                print(f"nu is: {gp['nu']}")
                 return 1e10
             
         ll, _, _ = self._filter(params, self._arr)
@@ -455,7 +460,7 @@ class HaasMSGarch:
             if self.dist == 't':
                 garch_x0.append(8.0)
                 
-        return np.concatenate(p_diag, garch_x0)
+        return np.concatenate([p_diag, garch_x0])
     
     def fit(self,
             returns :Series,
@@ -514,7 +519,7 @@ class HaasMSGarch:
         if verbose:
             print(f"Total function evaluations: {total_evals}")
         
-        if best_result is None or not np.isinf(best_ll):
+        if best_result is None or np.isinf(best_ll):
             raise RuntimeError("Optimisation failed to converge.")
         
         self.params_ = best_result.x
@@ -579,13 +584,38 @@ class HaasMSGarch:
         print(f'\nLog-Lik: {self.loglik_}')
         print(f'\nAIC: {self.aic_}')
         print(f'\nBIC: {self.bic_}')
+        print(f'\nRegimes: {K}')
+        print('=' * 50)
         
-            
-            
+        print(f"\nTransition Matrix P[i,j] = P(S_t = j| S_{{t-1}}=i):")
+        print(f"             Regime {j:.4f}" for j in range(K))  
+        for i in range(K):
+            print(f' Reg[{i}]:  {P[i,j]:4f} ' for j in range(K))
         
-            
-                   
-         
+        print('-' * 50)
         
-            
-            
+        print('\nRegime Classification:')
+        classification = self.filtered_probs_.values.argmax(axis=1)
+        print(f"Regime      Label     Obs     Share     ")
+        print('-' *50)
+        for k in range(K):
+            label = 'low volatility' if k == self.regime_labels['low_vol'] else 'high_vol'
+            n = int((classification == K).sum())
+            print(f'{k}     {label}     {n}     {100 * n/T}%')
+        
+        print(f'\nGARCH(1,1) Parameters by Regime:')
+        header = 'Regime     mu     omega      alpha     beta     persistence'
+        if self.dist == 't':
+            header += '     nu'
+        print(header)
+        print('-' * 50)
+        for k in range(K):
+            gp = garch[k]
+            ab = gp['alpha'] + gp['beta']
+            unc = gp['omega'] / max(1 - ab, 1e-5)
+            vals = [k,gp['mu'], gp['omega'], gp['alpha'], gp['beta'], ab]
+            if self.dist == 't':
+                vals.append(gp['mu'])
+            print(f'Unconditional variance = {unc:.4f}'
+                  f'(sigma = {np.sqrt(unc):.4f})')
+                      
