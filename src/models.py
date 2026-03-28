@@ -203,6 +203,17 @@ def rolling_ms_var(returns: Series,
     return sorted_indicies, np.array(var_results), np.array(actual)
 
 
+def _fast_std_norm_pdf(z: np.ndarray) -> np.ndarray:
+    return np.exp(-.5 * z * z) / np.sqrt(2 * np.pi)
+    
+def _fast_std_t_pdf(
+    z: np.ndarray,
+    nu: np.ndarray,
+    const: np.ndarray
+    ) -> np.ndarray:
+    
+    term = 1 + z*z / (nu-2)
+    return const * term ** (-(nu+1) / 2)
 
 class HaasMSGarch:
     """
@@ -240,7 +251,11 @@ class HaasMSGarch:
     def n_params(self) -> int:
         return self.k_regimes + self.k_regimes * self._n_regime_params
     
-    def _pack(self, p_diag: np.ndarray, garch: list[dict[str,float]]):
+    def _pack(
+        self,
+        p_diag: np.ndarray,
+        garch: list[dict[str,float]]
+        ):
         parts = list(p_diag)
         for gp in garch:
             parts += [gp['mu'], gp['omega'], gp['alpha'], gp['beta']]
@@ -248,7 +263,10 @@ class HaasMSGarch:
                 parts.append(gp['nu'])
         return np.array(parts, dtype=float)
    
-    def _build_P(self, p_diag: np.ndarray) -> np.ndarray:
+    def _build_P(
+        self,
+        p_diag: np.ndarray
+        ) -> np.ndarray:
         K = self.k_regimes
         P = np.zeros((K,K))
         
@@ -260,8 +278,10 @@ class HaasMSGarch:
                     P[i,j] = off
         return P
     
-    def _unpack(self, params: np.ndarray
-                ) -> tuple[np.ndarray, list[dict[str,float]], np.ndarray]:
+    def _unpack(
+        self,
+        params: np.ndarray        
+        ) -> tuple[np.ndarray, list[dict[str,float]], np.ndarray]:
         
         K = self.k_regimes
         p_diag = params[:K]
@@ -288,30 +308,35 @@ class HaasMSGarch:
         return p_diag, garch, P 
             
             
-    def _stationary(self, P:np.ndarray) -> np.ndarray:
-        K = P.shape[0]
+    def _stationary(
+        self,
+        P:np.ndarray
+        ) -> np.ndarray:
         
+        K = P.shape[0]
         A = P.T - np.eye(K)
         A[-1,:] = 1.0
         
         b = np.zeros(K)
         b[-1] = 1.0
         try:
-            pi = solve(A,b)
+            pi = solve(A, b)
         except Exception:
             pi = np.ones(K) / K
         
         pi = np.maximum(pi,1e-12)
         pi /= pi.sum()
         
-        return pi 
+        return pi
         
-    def _density(self,
-                 r: float,
-                 mu: float,
-                 h: float,
-                 nu: Optional[float] = None) -> float:
-        
+    def _density(
+        self,
+        r: float,
+        mu: float,
+        h: float,
+        nu: Optional[float] = None
+        ) -> float:
+
         sigma = np.sqrt(max(h, 1e-12))
         z = float((r-mu) / sigma)
         
@@ -321,11 +346,13 @@ class HaasMSGarch:
             scale = np.sqrt(nu / (nu-2.0))
             return float(t_dist.pdf(float(z * scale), df=nu) * scale / sigma)
         
-    def _filter(self,
-                params: np.ndarray,
-                returns: np.ndarray):
-        
-        k, garch, P = self._unpack(params)
+    def _filter(
+        self,
+        params: np.ndarray,
+        returns: np.ndarray
+        ):
+
+        _, garch, P = self._unpack(params)
         K = self.k_regimes
         T = len(returns)
         
@@ -335,15 +362,18 @@ class HaasMSGarch:
         beta = np.array([gp['beta'] for gp in garch])
        
         if self.dist == 't':
-           nu = np.array([gp['nu'] for gp in garch])
+            nu = np.array([gp['nu'] for gp in garch])
+            from scipy.special import gamma
+            const = gamma((nu+1) / 2) / (np.sqrt((nu-2) * np.pi) * gamma(nu/2))
         else:
             nu = None
+            const = None
             
         xi = self._stationary(P)
         denom = 1 - alpha - beta
-        denom = np.maximum(denom, 1e-10)
+        denom = np.maximum(denom, 1e-8)
         h = omega / denom
-        h = np.maximum(h, 1e-12)
+        h = np.maximum(h, 1e-10)
         
         xi_filtered = np.zeros((T,K), dtype=float)
         h_all = np.zeros((T,K), dtype=float)
@@ -357,15 +387,15 @@ class HaasMSGarch:
             z = (r_t-mu) / sqrt_h
             
             if self.dist == 'normal':
-                eta = norm.pdf(z) / sqrt_h
+                eta = _fast_std_norm_pdf(z) / sqrt_h
             else:
-                 eta = t_dist.pdf(z, df=nu) / sqrt_h
-                
+                eta = _fast_std_t_pdf(z,nu=nu, const=const)/ sqrt_h
+
             eta = np.maximum(eta, 1e-300)
-            
+
             numerator = xi * eta
             total = numerator.sum()
-            
+
             if total <= 0 or not np.isfinite(total):
                 print(f'total: {total}, eta: {eta}')
                 return -1e10, xi_filtered, h_all
@@ -374,7 +404,7 @@ class HaasMSGarch:
             xi_filtered[t] = numerator / total
             
             xi = np.transpose(P) @ xi_filtered[t]
-            xi = np.maximum(xi, 1e-10)
+            xi = np.maximum(xi, 1e-12)
             xi /= xi.sum()
             
             
@@ -384,7 +414,10 @@ class HaasMSGarch:
             
         return loglik, xi_filtered, h_all
     
-    def _neg_loglik(self, params: np.ndarray):
+    def _neg_loglik(
+        self,
+        params: np.ndarray
+        ):
         
         if not np.all(np.isfinite(params)):
             print("WARNING: Non-finite parameters received.")
@@ -395,33 +428,35 @@ class HaasMSGarch:
         
         for _, p in enumerate(params[:K]):
             if not (1e-4 < p < 1-1e-4):
-                print(f'p is {P}')
+               # print(f'p is {p}')
                 return 1e10
         
         for gp in garch:
             if gp['omega'] < 0 or gp['alpha'] < 0 or gp['beta'] < 0:
-                print(f' Omega: {gp['omega']} alpha:  {gp['alpha']} beta: {gp['beta']}')
+                #print(f' Omega: {gp['omega']} alpha:  {gp['alpha']} beta: {gp['beta']}')
                 return 1e10
-            if gp['alpha'] + gp['beta'] >= 0.99999:
-                print(f'Persistence is: {gp['alpha'] + gp['beta']}')
+            if gp['alpha'] + gp['beta'] >= 0.9999:
+                #print(f'Persistence is: {gp['alpha'] + gp['beta']}')
                 return 1e10
             if self.dist == 't' and gp.get('nu',10) <= 2.0:
-                print(f"nu is: {gp['nu']}")
+                #print(f"nu is: {gp['nu']}")
                 return 1e10
             
         ll, _, _ = self._filter(params, self._arr)
         return -ll
     
-    def _bounds(self):
+    def _bounds(
+        self
+        ):
         K = self.k_regimes
-        bounds = [(0.5, 0.99999)] * K
+        bounds = [(0.5, 0.9999)] * K
         
         for _ in range(K):
             bounds += [
                 (-5.0, 5.0),  #mu
                 (1e-8, 10.0),  # omega
-                (1e-8, 0.5),  # alpha
-                (1e-8, 0.99999),  #beta
+                (1e-8, 0.45),  # alpha
+                (1e-8, 0.9999),  #beta
             ]
             if self.dist == 't':
                 bounds.append((2.01, 100))  # nu
@@ -429,49 +464,54 @@ class HaasMSGarch:
         return bounds
 
     
-    def _starting_values(self, returns: np.ndarray) -> np.ndarray:
+    def _starting_values(
+        self,
+        returns: np.ndarray
+        ) -> np.ndarray:
         
         K = self.k_regimes
         abs_ret = np.abs(returns)
         quantiles = np.linspace(0, 100, K+1)[1:-1]
-        thresholds = np.percentile(abs_ret, quantiles) if K > 2 else [np.percentile(abs_ret, 70)]
+        thresholds = np.percentile(abs_ret, quantiles) if K > 2 \
+        else [np.percentile(abs_ret, 70)]
         
         
-        cluster = [[] for _ in range(K)]
+        cluster: list[list[float]] = [[] for _ in range(K)]
         for r in returns:
             placed = False
             for i, thr in enumerate(thresholds):
                 if abs(r) <= thr:
-                    cluster[i].append(r)
+                    cluster[i].append(float(r))
                     placed = True
                     break
             if not placed:
-                cluster[-1].append(r)
+                cluster[-1].append(float(r))
         
-        p_diag = np.full(K,0.95)
+        p_diag = np.full(K,0.97)
         
-        garch_x0 = []
+        garch_x0: list[float] = []
         for k in range(K):
             rd = np.array(cluster[k] if len(cluster[k]) > 30 else returns)
             mu_k = float(np.mean(rd))
             var_k = max(float(np.var(rd)), 1e-5)
             omega_k = var_k * 0.05
-            garch_x0 += [mu_k, omega_k, 0.05, 0.9]
+            garch_x0 += [mu_k, omega_k, 0.05, 0.85]
             if self.dist == 't':
                 garch_x0.append(8.0)
                 
         return np.concatenate([p_diag, garch_x0])
     
-    def fit(self,
-            returns :Series,
-            verbose: bool = True,
-            start_params: Optional[np.ndarray] = None
-            ) -> "HaasMSGarch":
-        
+    def fit(
+        self,
+        returns :Series,
+        verbose: bool = True,
+        start_params: Optional[np.ndarray] = None
+        ) -> "HaasMSGarch":
+    
         from scipy.optimize import minimize
         from tqdm import tqdm
         
-        self._returns = returns
+        self._returns = returns.copy()
         self._arr = np.array(returns)
         T = len(self._arr)
         
@@ -510,7 +550,7 @@ class HaasMSGarch:
         if verbose:
             status = "Y" if results.success else "N"
             print(f'Status: {status}'
-                f"LL = {results.fun:.4f}")
+                f"LL = {-results.fun:.4f}")
             
         if -results.fun > best_ll:
             best_ll = -results.fun
@@ -588,9 +628,11 @@ class HaasMSGarch:
         print('=' * 50)
         
         print(f"\nTransition Matrix P[i,j] = P(S_t = j| S_{{t-1}}=i):")
-        print(f"             Regime {j:.4f}" for j in range(K))  
+        header = "          " + "".join(f' Regime {j}' for j in range(K))
+        print(header)  
         for i in range(K):
-            print(f' Reg[{i}]:  {P[i,j]:4f} ' for j in range(K))
+            row = f' Reg[{i}]:' + ''.join(f'{P[i,j]:4f}'  for j in range(K))
+            print(row)
         
         print('-' * 50)
         
@@ -600,7 +642,7 @@ class HaasMSGarch:
         print('-' *50)
         for k in range(K):
             label = 'low volatility' if k == self.regime_labels['low_vol'] else 'high_vol'
-            n = int((classification == K).sum())
+            n = int((classification == k).sum())
             print(f'{k}     {label}     {n}     {100 * n/T}%')
         
         print(f'\nGARCH(1,1) Parameters by Regime:')
@@ -612,10 +654,11 @@ class HaasMSGarch:
         for k in range(K):
             gp = garch[k]
             ab = gp['alpha'] + gp['beta']
-            unc = gp['omega'] / max(1 - ab, 1e-5)
-            vals = [k,gp['mu'], gp['omega'], gp['alpha'], gp['beta'], ab]
+            unc = gp['omega'] / max(1 - ab, 1e-8)
+            row = f"{k:<8} {gp['mu']:<8.4f} {gp['omega']:<10.4f} {gp['alpha']:<8.4f} {gp['beta']:<8.4f} {ab:<12.4f}"
             if self.dist == 't':
-                vals.append(gp['mu'])
-            print(f'Unconditional variance = {unc:.4f}'
-                  f'(sigma = {np.sqrt(unc):.4f})')
-                      
+                row += f" {gp['nu']:<8.3f}"
+            print(row)
+
+            print(f"    Unconditional variance = {unc:.4f} (sigma = {np.sqrt(unc):.4f})")
+                            
