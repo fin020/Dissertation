@@ -541,7 +541,7 @@ class HaasMSGarch:
             omega_k = var_k * 0.05
             garch_x0 += [mu_k, omega_k, 0.08, 0.88]
             if self.dist == 't':
-                garch_x0 += [5.0 if k == 1 else 10.0]
+                garch_x0 += [5.0]
                 
         return np.concatenate([p_diag, garch_x0])
     
@@ -559,7 +559,7 @@ class HaasMSGarch:
         self._returns = returns.copy()
         self._arr = np.array(returns)
         T = len(self._arr)
-        
+        K = self.k_regimes
         if verbose:
             print(f'Fitting Haas Markov_Switching GARCH(1,1) Model:'
                   f' K = {self.k_regimes}, dist={self.dist}'
@@ -583,16 +583,29 @@ class HaasMSGarch:
             else:
                 rng = np.random.default_rng(restarts)
                 bounds_arr = np.array(self._bounds())
+                x0 = x0_base.copy()
+                
                 noise = rng.normal(0,0.02, size=len(x0_base))
-                x0 = np.clip(x0_base + noise,
+                
+                for regime in range(K):
+                    omega_idx = K + regime * (4 + (1 if self.dist == 't' else 0)) + 1
+                    factor = np.exp(rng.normal(0,0.5))
+                    x0[omega_idx] = x0_base[omega_idx] * factor
+                    
+                    if self.dist == 't':
+                        nu_idx = omega_idx + 3
+                        factor_nu = np.exp(rng.normal(0,0.3))
+                        x0[nu_idx] = x0_base[nu_idx] * factor_nu
+                        
+                x0 = np.clip(x0 + noise,
                 bounds_arr[:, 0] + 1e-6,
                 bounds_arr[:, 1] - 1e-6)
                     
             if verbose:
                 print(f'\nRestart {restarts + 1} / {n_restarts}'
-                f"initial LL = {self._neg_loglik(x0):.4f}")
+                    f" \ninitial LL = { -self._neg_loglik(x0):.4f}")
             
-            pbar = tqdm(desc='Fitting MS_GARCH.', total=1000)
+            pbar = tqdm(desc='Fitting MS_GARCH.', total=300)
             def callback(xk: np.ndarray):
                 pbar.update(1)
             
@@ -602,14 +615,14 @@ class HaasMSGarch:
                 method='L-BFGS-B',
                 bounds=self._bounds(),
                 callback=callback,
-                options={'maxiter': 1000,'ftol': 1e-8, 'gtol': 1e-5}
+                options={'maxiter': 300,'ftol': 1e-8, 'gtol': 1e-5}
             )
             total_evals += results.nfev
             
             if verbose:
                 status = "Y" if results.success else "N"
                 print(f'Status: {status}'
-                    f"LL = {-results.fun:.4f}")
+                    f"\nLL = {-results.fun:.4f}")
                 
             if -results.fun > best_ll:
                 best_ll = -results.fun
@@ -690,7 +703,7 @@ class HaasMSGarch:
         header = "          " + "".join(f' Regime {j}' for j in range(K))
         print(header)  
         for i in range(K):
-            row = f' Reg[{i}]:' + ''.join(f'{P[i,j]:4f}'  for j in range(K))
+            row = f' Reg[{i}]:' + ' '.join(f'{P[i,j]:4f} '  for j in range(K))
             print(row)
         
         print('-' * 50)
