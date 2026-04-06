@@ -8,9 +8,63 @@ from tqdm import tqdm
 from typing import Literal, Optional
 from arch import arch_model
 
-windowsize = 1000
-alpha = 0.01
-horizon = 1 
+
+def in_sample_ms_var(
+    params: Series,
+    smoothed_probs: pd.DataFrame,
+    k_regimes: int,
+    alpha: float
+    ) -> np.ndarray:
+    from scipy.stats import norm
+    from scipy.optimize import brentq
+    K = k_regimes
+    means = [params[f'const[{k}]'] for k in range(K)]
+    vars = [params[f'sigma2[{k}]'] for k in range(K)]
+    probs = smoothed_probs.values
+    
+    sigmas = np.sqrt(vars)
+    sigmas = np.maximum(sigmas, 1e-8)
+    
+    n_obs = probs.shape[0]
+    var_estimates = np.zeros(n_obs)
+    #print(f"means: {means}, sigmas: {sigmas}")
+    
+    def mix_cdf_0(x: float, row_probs:np.ndarray) -> float:
+        total = 0.0
+        for prob, mu, sigma in zip(row_probs, means, sigmas):
+            if prob > 0:
+                total += prob * norm.cdf(x, loc=mu, scale=sigma)
+        return total - alpha
+        
+    for t in range(n_obs):
+        probs_t = probs[t,:]
+        #print(f"t={t}, probs_t={probs_t}, sigmas: {sigmas}, means:{means}")
+        
+        if probs_t.sum() == 0:
+            var_estimates[t] = np.nan
+            continue
+        
+        a = -10
+        b= 10
+        f_a = mix_cdf_0(a,probs_t)
+        f_b = mix_cdf_0(b,probs_t)
+        #print(f"a={a}, b={b}, f_a={f_a}, f_b={f_b}")
+        
+        while f_a * f_b >= 0:
+            a -= 1
+            b += 1
+            f_a = mix_cdf_0(a,probs_t)
+            f_b = mix_cdf_0(b,probs_t)
+            #print(f"  expanded: a={a}, b={b}, f_a={f_a}, f_b={f_b}")
+        
+        def f(x: float):
+            return mix_cdf_0(x, probs_t)
+        
+        q = brentq(f=f,a=a, b=b)
+        var_estimates[t] = -q
+    
+    return var_estimates
+     
 
 def _garch_process(
     ti: int,
@@ -18,9 +72,12 @@ def _garch_process(
     window: int,
     alpha: float,
     horizon: int,
-    dist: Literal['normal', 't']):
+    dist: Literal['normal', 't'],
+    vol: Literal['GARCH', 'EGARCH'],
+    GRJ: int = 0
+    ):
     train = returns[ti-window:ti]
-    model = arch_model(train, vol='GARCH', p=1, q=1, dist=dist)
+    model = arch_model(train, vol=vol, p=1, q=1,o=GRJ, dist=dist)
     res = model.fit(disp='off')
     
     forecast = res.forecast(horizon=horizon)
@@ -39,9 +96,13 @@ def _garch_process(
     
     
 def rolling_garch_var(
-    returns:Series, window:int =1000,
-    alpha: float=0.01, horizon:int=1,
+    returns:Series, 
+    window:int =1000,
+    alpha: float=0.01,
+    horizon:int=1,
     dist:Literal['normal', "t"]='t',
+    vol:Literal['GARCH', 'EGARCH'] ='GARCH',
+    GRJ: int = 0,
     n_jobs: int = -1
     ):
     """
@@ -76,7 +137,8 @@ def rolling_garch_var(
             _garch_process,
             t, returns,
             window, alpha,
-            horizon, dist)
+            horizon, dist,
+            vol, GRJ)
                    for t in indicies]  # type: ignore
         
         results = {}
@@ -93,7 +155,6 @@ def rolling_garch_var(
     actual = [results[t][1] for t in sorted_indicies]  
     
     return sorted_indicies, np.array(var_forecasts), np.array(actual)
-
 
 
 def _ms_process(
@@ -212,8 +273,9 @@ def _fast_std_t_pdf(
     const: np.ndarray
     ) -> np.ndarray:
     
-    term = 1 + z*z / (nu-2)
-    return const * term ** (-(nu+1) / 2)
+    term = z*z / (nu-2)
+    log_term = np.log1p(term)
+    return const * np.exp(-(nu+1) / 2 * log_term)
 
 class HaasMSGarch:
     """
@@ -228,7 +290,7 @@ class HaasMSGarch:
         
         self.k_regimes = k_regimes
         self.dist = dist
-        self.params_ = None
+        self.params_: Optional[np.ndarray] = None
         self.filtered_probs_ = None
         self.h_ = None
         self.loglik_: Optional[float] = None
@@ -435,7 +497,7 @@ class HaasMSGarch:
             if gp['omega'] < 0 or gp['alpha'] < 0 or gp['beta'] < 0:
                 #print(f' Omega: {gp['omega']} alpha:  {gp['alpha']} beta: {gp['beta']}')
                 return 1e10
-            if gp['alpha'] + gp['beta'] >= 0.9999:
+            if gp['alpha'] + gp['beta'] >= 0.98:
                 #print(f'Persistence is: {gp['alpha'] + gp['beta']}')
                 return 1e10
             if self.dist == 't' and gp.get('nu',10) <= 2.0:
@@ -449,14 +511,14 @@ class HaasMSGarch:
         self
         ):
         K = self.k_regimes
-        bounds = [(0.5, 0.9999)] * K
+        bounds = [(0.7, 0.9999)] * K
         
         for _ in range(K):
             bounds += [
                 (-5.0, 5.0),  #mu
                 (1e-8, 10.0),  # omega
                 (1e-8, 0.45),  # alpha
-                (1e-8, 0.9999),  #beta
+                (1e-8, 0.97),  #beta
             ]
             if self.dist == 't':
                 bounds.append((2.01, 100))  # nu
@@ -495,15 +557,16 @@ class HaasMSGarch:
             mu_k = float(np.mean(rd))
             var_k = max(float(np.var(rd)), 1e-5)
             omega_k = var_k * 0.05
-            garch_x0 += [mu_k, omega_k, 0.05, 0.85]
+            garch_x0 += [mu_k, omega_k, 0.08, 0.88]
             if self.dist == 't':
-                garch_x0.append(8.0)
+                garch_x0 += [5.0 if k == 1 else 10.0]
                 
         return np.concatenate([p_diag, garch_x0])
     
     def fit(
         self,
-        returns :Series,
+        returns: Series,
+        n_restarts: int= 3, 
         verbose: bool = True,
         start_params: Optional[np.ndarray] = None
         ) -> "HaasMSGarch":
@@ -531,34 +594,48 @@ class HaasMSGarch:
                 raise ValueError(f'start param length {len(x0_base)} != {self.n_params}')
             
         total_evals = 0 
-        
-        pbar = tqdm(desc='Fitting MS_GARCH.', total=1000)
-        
-        def callback(xk: np.ndarray):
-            pbar.update(1)
-        
-        results = minimize(
-            self._neg_loglik,
-            x0=x0_base,
-            method='L-BFGS-B',
-            bounds=self._bounds(),
-            callback=callback,
-            options={'maxiter': 1000}
-        )
-        total_evals += results.nfev
-        
-        if verbose:
-            status = "Y" if results.success else "N"
-            print(f'Status: {status}'
-                f"LL = {-results.fun:.4f}")
+       
+        for restarts in range(n_restarts):
+            if restarts == 0:
+                x0 = x0_base.copy()
+            else:
+                rng = np.random.default_rng(restarts)
+                bounds_arr = np.array(self._bounds())
+                noise = rng.normal(0,0.02, size=len(x0_base))
+                x0 = np.clip(x0_base + noise,
+                bounds_arr[:, 0] + 1e-6,
+                bounds_arr[:, 1] - 1e-6)
+                    
+            if verbose:
+                print(f'\nRestart {restarts + 1} / {n_restarts}'
+                f"initial LL = {self._neg_loglik(x0):.4f}")
             
-        if -results.fun > best_ll:
-            best_ll = -results.fun
-            best_result = results
-        
-        if verbose:
-            print(f"Total function evaluations: {total_evals}")
-        
+            pbar = tqdm(desc='Fitting MS_GARCH.', total=1000)
+            def callback(xk: np.ndarray):
+                pbar.update(1)
+            
+            results = minimize(
+                self._neg_loglik,
+                x0,
+                method='L-BFGS-B',
+                bounds=self._bounds(),
+                callback=callback,
+                options={'maxiter': 1000,'ftol': 1e-8, 'gtol': 1e-5}
+            )
+            total_evals += results.nfev
+            
+            if verbose:
+                status = "Y" if results.success else "N"
+                print(f'Status: {status}'
+                    f"LL = {-results.fun:.4f}")
+                
+            if -results.fun > best_ll:
+                best_ll = -results.fun
+                best_result = results
+            
+            if verbose:
+                print(f"Total function evaluations: {total_evals}")
+            
         if best_result is None or np.isinf(best_ll):
             raise RuntimeError("Optimisation failed to converge.")
         
