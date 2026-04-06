@@ -3,7 +3,6 @@ from numpy.linalg import solve
 import pandas as pd
 from pandas import Series
 from scipy.stats import norm, t as t_dist
-from datetime import datetime 
 from tqdm import tqdm
 from typing import Literal, Optional
 from arch import arch_model
@@ -104,7 +103,7 @@ def rolling_garch_var(
     vol:Literal['GARCH', 'EGARCH'] ='GARCH',
     GRJ: int = 0,
     n_jobs: int = -1
-    ):
+    ) -> tuple[list[int],np.ndarray, np.ndarray]:
     """
     
     Parameters
@@ -141,7 +140,7 @@ def rolling_garch_var(
             vol, GRJ)
                    for t in indicies]  # type: ignore
         
-        results = {}
+        results: dict[int, tuple[float,float]] = {}
         pbar = tqdm(total=len(futures), desc="Calculating rolling GARCH VaR")
         
         for future in as_completed(futures): # type: ignore
@@ -207,7 +206,7 @@ def _ms_process(
     
     pi_next = filtered_probs @ trans_mat
     
-    def cdf(x):
+    def cdf(x:float):
         return np.sum(pi_next * norm.cdf((x - means) / sigmas)) - alpha
     
     low = np.min(means) - 5 * np.max(sigmas)
@@ -247,7 +246,7 @@ def rolling_ms_var(returns: Series,
                    for t in indicies]
         
         
-        results = {}
+        results:dict[int, tuple[float,float]] = {}
         
         pbar = tqdm(total=len(futures), desc="Rolling Markov Switching model loading")
         
@@ -390,23 +389,6 @@ class HaasMSGarch:
         pi /= pi.sum()
         
         return pi
-        
-    def _density(
-        self,
-        r: float,
-        mu: float,
-        h: float,
-        nu: Optional[float] = None
-        ) -> float:
-
-        sigma = np.sqrt(max(h, 1e-12))
-        z = float((r-mu) / sigma)
-        
-        if self.dist == 'normal' or nu is None:
-            return float(norm.pdf(z) / sigma)
-        else:
-            scale = np.sqrt(nu / (nu-2.0))
-            return float(t_dist.pdf(float(z * scale), df=nu) * scale / sigma)
         
     def _filter(
         self,
@@ -738,4 +720,129 @@ class HaasMSGarch:
             print(row)
 
             print(f"    Unconditional variance = {unc:.4f} (sigma = {np.sqrt(unc):.4f})")
-                            
+    
+    def predict_var(
+        self,
+        confidence:float = 0.95
+    ) -> float:
+        
+        if not self.is_fitted:
+            raise RuntimeError('Call .fit() prior to forecastin .')
+        
+        from scipy.optimize import brentq
+        from scipy.stats import norm, t
+        
+        _, garch, P = self._unpack(self.params_)  # type: ignore
+        
+        mu = np.array([gp['mu'] for gp in garch])
+        omega = np.array([gp['omega'] for gp in garch])
+        alpha = np.array([gp['alpha'] for gp in garch])
+        beta = np.array([gp['beta'] for gp in garch])
+        
+        
+        if self.dist == 't':
+            nu = np.array([gp['nu'] for gp in garch])
+        else:
+            nu = None
+            
+        xi_T = self.filtered_probs_.values[-1]  # type: ignore
+        pi_next = P.T @ xi_T
+        pi_next = np.maximum(pi_next, 1e-10)
+        pi_next /= pi_next.sum()
+        
+        h_t = self.h_.values[-1]  # type: ignore
+        r_t = float(self._arr[-1])  # type: ignore
+        e2 = (r_t - mu) ** 2
+        h_next = omega + alpha * e2 + beta * h_t
+        sigma_next = max(np.sqrt(h_next),1e-5)
+        
+        def mix_cdf(x: float) -> float:
+            if self.dist == 'normal':
+                component_cdfs = norm.cdf((x-mu) / sigma_next)  # type: ignore
+            elif self.dist == 't':
+                z = (x - mu) / sigma_next * np.sqrt(nu / (nu-2.0)) # type: ignore
+                component_cdfs = t.cdf(z, df=nu)  # type: ignore
+            
+            return float(np.dot(pi_next,component_cdfs)) - (1-confidence)  # type: ignore
+        
+        low = float(np.min(mu) - 10.0 * np.max(sigma_next))
+        high = float(np.max(mu) + 10.0 * np.max(sigma_next))
+        
+        expansions = 0
+        while mix_cdf(low) * mix_cdf(high) < 0:
+            if expansions >= 20:
+                raise RuntimeError("No sign change. VaR cannot be computed.")
+            else:
+                low -= np.max(sigma_next)
+                high += np.max(sigma_next)
+                expansions += 1
+        
+        try:
+            q = brentq(mix_cdf, low, high, maxiter=200)
+        except ValueError:
+            return np.nan
+        
+        return float(-q)
+    
+
+def _ms_garch_process(
+    ti: int,
+    returns: Series,
+    k_regimes: int,
+    window: int,
+    alpha: float,
+    dist: Literal['t', 'normal'],
+    n_restarts: int
+) -> tuple[int, float, float]:
+    
+    train = returns[ti - window: ti]
+    model = HaasMSGarch(k_regimes=k_regimes, dist=dist)
+    
+    try:
+        model.fit(train, n_restarts=n_restarts, verbose=False)
+        var_forecast = (model.predict_var(confidence=(1-alpha)))
+    except Exception:
+        var_forecast = np.nan
+    
+    t = ti
+    actual = float(returns.iloc[ti])
+    return t, actual, float(var_forecast)
+
+def rolling_ms_garch_var(
+    returns: Series,
+    k_regimes: int =2,
+    window: int =500,
+    alpha: float =0.05,
+    dist: Literal['t', 'normal'] = 'normal',
+    n_restarts: int = 1,
+    n_jobs: int = -1
+) -> tuple[list[int], np.ndarray, np.ndarray]:
+    
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+    from tqdm import tqdm
+    
+    indicies = list(range(window, len(returns)))
+    max_workers = None if n_jobs == -1 else n_jobs
+    
+    results: dict[int, tuple[float, float]] = {}
+    
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(
+                _ms_garch_process,
+                t, returns, k_regimes, window, alpha, dist, n_restarts
+            ): t
+            for t in indicies
+        }
+
+        pbar = tqdm(total=len(futures), desc='Rolling MS-GARCH VaR')
+        for future in as_completed(futures):
+            t, actual, var_forecast = future.result()
+            results[t] = (actual, var_forecast)
+            pbar.update(1)
+        pbar.close()
+
+    sorted_indicies = sorted(results.keys())
+    actuals = np.array([results[d][0] for d in sorted_indicies])
+    var_forecasts= np.array([results[d][1] for d in sorted_indicies])
+    return sorted_indicies, actuals, var_forecasts
