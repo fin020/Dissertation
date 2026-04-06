@@ -1,3 +1,4 @@
+import pandas as pd
 from pandas import Series
 from scipy.stats import chi2
 from scipy.optimize import minimize
@@ -54,8 +55,8 @@ def kupiec_test(I:Series, alpha:float) -> dict[str, float]:
     -------
     dict: 
         Likelihood ratio for the kupiec test.
-        1% significance level.
-        5% significance level.
+        1% critical value.
+        5% critical value.
         p_value.
     
     """
@@ -73,8 +74,8 @@ def kupiec_test(I:Series, alpha:float) -> dict[str, float]:
     p_value: float = cast(float, 1 - chi2.cdf(lr_POF, df=1))
     
     result: dict[str,float] = {"LR_POF": lr_POF,
-              r"1% significance:": chi_result[0],
-              r"5% significance:": chi_result[1],
+              r"1% critical:": chi_result[0],
+              r"5% critical:": chi_result[1],
               "p-value": p_value}
     
     return result
@@ -95,8 +96,8 @@ def christofferssen_test(
     -------
     dict:  
         Likelihood ratio test statistic
-        1% signficance level
-        5% significance level
+        1% critical value
+        5% critical value
         p_value    
     """
     n_00 = 0
@@ -135,8 +136,8 @@ def christofferssen_test(
     p_value: float = cast(float, 1 - chi2.cdf(LR_CCI, df=1))
     
     result: dict[str,float] = {"LR_IND": LR_CCI,
-              r"1% significance:": chi_result[0],
-              r"5% significance:": chi_result[1],
+              r"1% critical:": chi_result[0],
+              r"5% critical:": chi_result[1],
               "p-value": p_value}
     
     return result
@@ -299,4 +300,49 @@ def duration_test_conditional(I: Series):
     return result
     
     
-#model comps table
+def backtest_all(
+    returns: Series,
+    var: Series,
+    alpha: float = 0.05,
+    model_name: str = 'Model'
+) -> pd.DataFrame:
+    
+    hits = backtest_var(returns, var)
+    T = len(hits)
+    n_hits = hits.sum()
+    hit_rate = n_hits / T
+    
+    kup = kupiec_test(hits, alpha=alpha)
+    ind = christofferssen_test(hits)
+    cc = christofferssen_conditional_test(kup['LR_POF'], ind['LR_IND'])
+    dur_u = duration_test_unconditional(hits, alpha=alpha)
+    dur_c = duration_test_conditional(hits)
+    
+    rows: list[tuple[str, float, float, float]] = [
+        ("Kupiec POF", kup["LR_POF"], kup['5% critical:'], kup['p-value']),
+        ("Christoffersen IND", ind["LR_IND"], ind['5% critical:'], ind['p-value']),
+        ("Christoffersen CC", cc["LR_CC"], cc['5% critical:'], cc["p-value"]),
+        ("Duration Unconditional", dur_u["LR_dur_unc"], chi2.ppf(0.95,df=1), dur_u['p-value']),
+        ("Duration Conditional", dur_c["LR_dur_con"], chi2.ppf(0.95,df=1), dur_c['p-value'])        
+    ]
+    
+    records = []
+    for label, lr, crit, pval in rows:
+        records.append({
+            "Test": label,
+            "LR Statistic": round(lr,4),
+            "Critical (5%)": round(crit,4),
+            "p-value": round(pval,4),
+            "Reject H0 (5%)": "Yes" if lr>crit else "No"
+        })
+        
+    df = pd.DataFrame(records).set_index("Test")
+    
+    print("\n" "="*50)
+    print(f'Backtesting - {model_name}')
+    print("\n" "="*50)
+    print(f"Observations: {T}")
+    print(f"Violations: {hits}")
+    print(f"Hit Rate: {hit_rate}")
+    print("\n" "="*50)
+    return df
